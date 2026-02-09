@@ -1,0 +1,80 @@
+#!/bin/bash
+# Pre-commit hook for Mole.
+# Validates changed files before commit.
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+FAILED=0
+
+# Get staged files
+STAGED_SH=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(sh|bats)$' || true)
+STAGED_GO=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.go$' || true)
+
+# Also check the main 'mole' script if staged
+if git diff --cached --name-only --diff-filter=ACM | grep -q '^mole$'; then
+    STAGED_SH="mole
+$STAGED_SH"
+fi
+
+# Syntax check staged shell files
+if [[ -n "$STAGED_SH" ]]; then
+    echo "Checking shell syntax..."
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        if ! bash -n "$file" 2>&1; then
+            echo -e "${RED}✗ Syntax error: $file${NC}"
+            FAILED=1
+        fi
+    done <<< "$STAGED_SH"
+
+    # ShellCheck on staged files
+    if command -v shellcheck > /dev/null 2>&1; then
+        echo "Running ShellCheck..."
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if ! shellcheck "$file" 2>&1; then
+                echo -e "${RED}✗ ShellCheck failed: $file${NC}"
+                FAILED=1
+            fi
+        done <<< "$STAGED_SH"
+    fi
+
+    # Format check (no auto-fix, just detect)
+    if command -v shfmt > /dev/null 2>&1; then
+        echo "Checking shell formatting..."
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if ! shfmt -i 4 -ci -sr -d "$file" > /dev/null 2>&1; then
+                echo -e "${RED}✗ Formatting issue: $file (run: shfmt -i 4 -ci -sr -w $file)${NC}"
+                FAILED=1
+            fi
+        done <<< "$STAGED_SH"
+    fi
+fi
+
+# Go checks on staged files
+if [[ -n "$STAGED_GO" ]]; then
+    if command -v go > /dev/null 2>&1; then
+        echo "Running Go checks..."
+        if ! go vet ./cmd/... 2>&1; then
+            echo -e "${RED}✗ go vet failed${NC}"
+            FAILED=1
+        fi
+        if ! go build ./... 2>&1; then
+            echo -e "${RED}✗ go build failed${NC}"
+            FAILED=1
+        fi
+    fi
+fi
+
+if [[ $FAILED -ne 0 ]]; then
+    echo -e "\n${RED}Pre-commit checks failed. Fix issues and try again.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ Pre-commit checks passed${NC}"

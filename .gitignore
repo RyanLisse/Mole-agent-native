@@ -41,16 +41,17 @@ tests/tmp-*
 *.pid
 *.lock
 
-# AI Assistant Instructions
-.claude/
+# AI Assistant Instructions (other tools)
 .gemini/
 .kiro/
-CLAUDE.md
 GEMINI.md
 ANTIGRAVITY.md
 WARP.md
-AGENTS.md
 .cursorrules
+
+# Claude Code - tracked for agent-native development
+# .claude/ and CLAUDE.md are intentionally NOT ignored
+# AGENTS.md is intentionally NOT ignored
 
 # Go build artifacts (development)
 cmd/analyze/analyze

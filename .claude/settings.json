@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '=== Mole Development Environment ===' && echo '' && echo 'Quality: ./scripts/check.sh' && echo 'Tests:   ./scripts/test.sh' && echo 'Build:   make build' && echo '' && (command -v shellcheck >/dev/null 2>&1 && echo '✓ shellcheck' || echo '✗ shellcheck (install: brew install shellcheck)') && (command -v shfmt >/dev/null 2>&1 && echo '✓ shfmt' || echo '✗ shfmt (install: brew install shfmt)') && (command -v bats >/dev/null 2>&1 && echo '✓ bats' || echo '✗ bats (install: brew install bats-core)') && (command -v go >/dev/null 2>&1 && echo '✓ go' || echo '✗ go (install: brew install go)') && (command -v golangci-lint >/dev/null 2>&1 && echo '✓ golangci-lint' || echo '✗ golangci-lint (install: brew install golangci-lint)') && echo ''"
+          }
+        ]
+      }
+    ]
+  }
+}
