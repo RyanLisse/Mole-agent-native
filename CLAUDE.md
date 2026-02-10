@@ -77,7 +77,26 @@ tests/                        # BATS test suite (180+ test cases)
 scripts/
   check.sh                   # Quality checks: format + lint + syntax
   test.sh                     # Test runner: lint + BATS + Go tests
+  quick-check.sh              # Fast changed-files-only validation (<10s)
+  bd                          # Beads task tracker (git-backed)
+  pre-commit                  # Pre-commit hook (syntax + shellcheck + format)
+  commit-msg                  # Commit message convention enforcement
+  install-hooks.sh            # Install git hooks
   setup-quick-launchers.sh    # Raycast/Alfred integration
+.claude/
+  settings.json               # SessionStart hooks, tool permissions
+  skills/
+    brainstorm/SKILL.md       # Investigation-first brainstorming
+    plan-to-epic/SKILL.md     # Convert plans to beads epics
+    epic-executor/SKILL.md    # Sequential task execution with review
+    review/SKILL.md           # Mole-specific multi-perspective review
+    compound/SKILL.md         # Knowledge capture after fixes
+    audit/SKILL.md            # Agent-native scoring audit
+.beads/                        # Persistent task state (git-tracked)
+docs/
+  plans/                       # Design documents and implementation plans
+  solutions/                   # Captured bug fixes (compound docs)
+  learnings/                   # Reusable patterns and knowledge
 ```
 
 ## Commands
@@ -110,9 +129,21 @@ go build ./...
 go vet ./cmd/...
 go test ./cmd/...
 
+# Quick check (changed files only, <10 seconds)
+./scripts/quick-check.sh
+
 # Syntax check individual scripts
 bash -n mole
 bash -n bin/clean.sh
+
+# Beads task tracker
+bd ready                     # What tasks are actionable?
+bd epic status bd-XXXX       # Epic progress
+bd show bd-XXXX.N            # Task details
+bd create "title" --parent bd-XXXX  # Add task to epic
+
+# Install git hooks (pre-commit + commit-msg)
+./scripts/install-hooks.sh
 ```
 
 ## Code Conventions
@@ -219,6 +250,46 @@ teardown() {
 - Commit messages: `<type>(<scope>): <description>`
   - Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `security`
   - Scopes: `core`, `clean`, `optimize`, `analyze`, `status`, `uninstall`, `ci`, `purge`
+
+## Task Management (Beads Workflow)
+
+This project uses **beads** (`scripts/bd`) for persistent task tracking across agent sessions.
+
+### Rules
+
+- **ALWAYS** check `bd ready` before asking "what should I work on?"
+- **ALWAYS** run `bd update <id> --claim` when starting a task
+- **ALWAYS** close tasks when done: `bd close <id> --reason "explanation"`
+- **ALWAYS** include bead IDs in commit messages: `feat(core): add X (bd-0001.3)`
+- **NEVER** use markdown TODO lists for tracking work -- use beads
+- Run `bd sync` at end of session to stage state for commit
+
+### Workflow: Plan -> Work -> Review -> Compound
+
+1. **Plan**: Brainstorm and investigate before coding. Write plan to `docs/plans/`.
+2. **Work**: Execute tasks from `bd ready`, one at a time, sequentially.
+3. **Review**: Two-stage -- spec compliance first, code quality second. Fix before closing.
+4. **Compound**: After fixes, capture learnings in `docs/solutions/` or `docs/learnings/`.
+
+### Common Commands
+
+```bash
+bd ready                        # What's actionable right now?
+bd epic status bd-XXXX          # Overall progress on an epic
+bd show bd-XXXX.N               # Full context for a task
+bd update bd-XXXX.N --claim     # Claim and start working
+bd close bd-XXXX.N              # Mark complete
+bd comment bd-XXXX.N "notes"    # Add context for future sessions
+bd list --status open           # All open issues
+```
+
+### Landing the Plane (End of Session)
+
+Before ending any session:
+1. Update bead statuses (`bd update` / `bd close` for completed work)
+2. Run `./scripts/check.sh` and `./scripts/test.sh`
+3. `bd sync` to stage beads state
+4. Commit and push
 
 ## Key Learnings
 
