@@ -1,0 +1,590 @@
+#!/bin/bash
+# bd - Lightweight beads-compatible task tracker for Mole
+# Provides the core beads workflow without requiring the full binary.
+# State is stored in .beads/issues.jsonl (git-tracked).
+#
+# Usage:
+#   bd init              Initialize .beads/ in current project
+#   bd create "title"    Create a new task
+#   bd list              List all open tasks
+#   bd show <id>         Show task details
+#   bd update <id> ...   Update task fields
+#   bd close <id>        Close a task
+#   bd ready             Show tasks with no open blockers
+#   bd epic status <id>  Show epic progress
+#   bd comment <id> msg  Add a comment to a task
+#   bd sync              Export state to JSONL
+
+set -euo pipefail
+
+BEADS_DIR=".beads"
+DB_FILE="$BEADS_DIR/issues.jsonl"
+COUNTER_FILE="$BEADS_DIR/.counter"
+
+# Ensure jq-like JSON handling with pure bash
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+_timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+_next_id() {
+    local counter=0
+    if [[ -f "$COUNTER_FILE" ]]; then
+        counter=$(cat "$COUNTER_FILE")
+    fi
+    counter=$((counter + 1))
+    echo "$counter" > "$COUNTER_FILE"
+    printf 'bd-%04d' "$counter"
+}
+
+_find_issue() {
+    local id="$1"
+    if [[ ! -f "$DB_FILE" ]]; then
+        echo ""
+        return
+    fi
+    grep "\"id\":\"$id\"" "$DB_FILE" | tail -1
+}
+
+_is_epic() {
+    local id="$1"
+    local issue
+    issue=$(_find_issue "$id")
+    if [[ -z "$issue" ]]; then
+        return 1
+    fi
+    echo "$issue" | grep -q '"type":"epic"'
+}
+
+cmd_init() {
+    mkdir -p "$BEADS_DIR"
+    if [[ ! -f "$DB_FILE" ]]; then
+        touch "$DB_FILE"
+    fi
+    if [[ ! -f "$COUNTER_FILE" ]]; then
+        echo "0" > "$COUNTER_FILE"
+    fi
+    echo "Initialized beads in $BEADS_DIR/"
+}
+
+cmd_create() {
+    local title=""
+    local description=""
+    local type="task"
+    local priority="2"
+    local parent=""
+    local acceptance=""
+    local design=""
+    local labels=""
+    local json_output=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t | --type) type="$2"; shift 2 ;;
+            -p | --priority) priority="$2"; shift 2 ;;
+            -d | --description) description="$2"; shift 2 ;;
+            --parent) parent="$2"; shift 2 ;;
+            --acceptance) acceptance="$2"; shift 2 ;;
+            --design) design="$2"; shift 2 ;;
+            -l | --labels) labels="$2"; shift 2 ;;
+            --json) json_output=true; shift ;;
+            *)
+                if [[ -z "$title" ]]; then
+                    title="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$title" ]]; then
+        echo "Error: title required" >&2
+        exit 1
+    fi
+
+    local id
+    if [[ -n "$parent" ]]; then
+        # Count existing children of parent
+        local child_count=0
+        if [[ -f "$DB_FILE" ]]; then
+            child_count=$(grep -c "\"parent\":\"$parent\"" "$DB_FILE" 2>/dev/null || true)
+            child_count=${child_count:-0}
+            child_count=$(echo "$child_count" | tr -d '[:space:]')
+        fi
+        child_count=$((child_count + 1))
+        id="${parent}.${child_count}"
+        # Still increment counter for uniqueness
+        _next_id > /dev/null
+    else
+        id=$(_next_id)
+    fi
+
+    local now
+    now=$(_timestamp)
+    local esc_title esc_desc esc_accept esc_design
+    esc_title=$(_json_escape "$title")
+    esc_desc=$(_json_escape "$description")
+    esc_accept=$(_json_escape "$acceptance")
+    esc_design=$(_json_escape "$design")
+
+    local record="{\"id\":\"$id\",\"title\":\"$esc_title\",\"description\":\"$esc_desc\",\"type\":\"$type\",\"status\":\"open\",\"priority\":$priority,\"parent\":\"$parent\",\"acceptance\":\"$esc_accept\",\"design\":\"$esc_design\",\"labels\":\"$labels\",\"created\":\"$now\",\"updated\":\"$now\",\"comments\":[]}"
+
+    echo "$record" >> "$DB_FILE"
+
+    if $json_output; then
+        echo "$record"
+    else
+        echo "Created $type $id: $title"
+    fi
+}
+
+cmd_list() {
+    local status_filter=""
+    local json_output=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status) status_filter="$2"; shift 2 ;;
+            --json) json_output=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ ! -f "$DB_FILE" ]] || [[ ! -s "$DB_FILE" ]]; then
+        echo "No issues found."
+        return
+    fi
+
+    # Deduplicate: keep last line per ID (latest update)
+    local seen_ids=""
+    local lines=()
+    while IFS= read -r line; do
+        lines+=("$line")
+    done < "$DB_FILE"
+
+    # Read in reverse to get latest version of each ID
+    local unique_lines=()
+    local i=${#lines[@]}
+    while [[ $i -gt 0 ]]; do
+        i=$((i - 1))
+        local line="${lines[$i]}"
+        local id
+        id=$(echo "$line" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [[ -z "$id" ]]; then continue; fi
+        if echo "$seen_ids" | grep -q "|$id|"; then continue; fi
+        seen_ids="${seen_ids}|$id|"
+        unique_lines=("$line" "${unique_lines[@]}")
+    done
+
+    if $json_output; then
+        printf '[\n'
+        local first=true
+        for line in "${unique_lines[@]}"; do
+            if [[ -n "$status_filter" ]]; then
+                if ! echo "$line" | grep -q "\"status\":\"$status_filter\""; then
+                    continue
+                fi
+            fi
+            if $first; then first=false; else printf ',\n'; fi
+            printf '%s' "$line"
+        done
+        printf '\n]\n'
+    else
+        printf "%-12s %-10s %-8s %-6s %s\n" "ID" "STATUS" "TYPE" "PRI" "TITLE"
+        printf "%-12s %-10s %-8s %-6s %s\n" "---" "---" "---" "---" "---"
+        for line in "${unique_lines[@]}"; do
+            if [[ -n "$status_filter" ]]; then
+                if ! echo "$line" | grep -q "\"status\":\"$status_filter\""; then
+                    continue
+                fi
+            fi
+            local id status type pri title
+            id=$(echo "$line" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            status=$(echo "$line" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+            type=$(echo "$line" | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+            pri=$(echo "$line" | grep -o '"priority":[0-9]*' | head -1 | cut -d: -f2)
+            title=$(echo "$line" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+            printf "%-12s %-10s %-8s %-6s %s\n" "$id" "$status" "$type" "P$pri" "$title"
+        done
+    fi
+}
+
+cmd_show() {
+    local id="$1"
+    local issue
+    issue=$(_find_issue "$id")
+    if [[ -z "$issue" ]]; then
+        echo "Issue $id not found" >&2
+        exit 1
+    fi
+
+    local title status type pri desc accept design parent created updated
+    title=$(echo "$issue" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+    status=$(echo "$issue" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    type=$(echo "$issue" | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+    pri=$(echo "$issue" | grep -o '"priority":[0-9]*' | head -1 | cut -d: -f2)
+    desc=$(echo "$issue" | grep -o '"description":"[^"]*"' | head -1 | cut -d'"' -f4)
+    accept=$(echo "$issue" | grep -o '"acceptance":"[^"]*"' | head -1 | cut -d'"' -f4)
+    design=$(echo "$issue" | grep -o '"design":"[^"]*"' | head -1 | cut -d'"' -f4)
+    parent=$(echo "$issue" | grep -o '"parent":"[^"]*"' | head -1 | cut -d'"' -f4)
+    created=$(echo "$issue" | grep -o '"created":"[^"]*"' | head -1 | cut -d'"' -f4)
+    updated=$(echo "$issue" | grep -o '"updated":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    echo "=== $id: $title ==="
+    echo "Type:       $type"
+    echo "Status:     $status"
+    echo "Priority:   P$pri"
+    [[ -n "$parent" ]] && echo "Parent:     $parent"
+    echo "Created:    $created"
+    echo "Updated:    $updated"
+    [[ -n "$desc" ]] && echo -e "\nDescription:\n  $desc"
+    [[ -n "$design" ]] && echo -e "\nDesign:\n  $design"
+    [[ -n "$accept" ]] && echo -e "\nAcceptance Criteria:\n  $accept"
+
+    # Show children if epic
+    if [[ "$type" == "epic" ]] && [[ -f "$DB_FILE" ]]; then
+        local children
+        children=$(grep "\"parent\":\"$id\"" "$DB_FILE" 2>/dev/null || true)
+        if [[ -n "$children" ]]; then
+            echo -e "\nChildren:"
+            # Read into array, then iterate reverse to get latest version per ID
+            local child_lines=()
+            while IFS= read -r child; do
+                child_lines+=("$child")
+            done <<< "$children"
+            local seen_child_ids=""
+            local unique_children=()
+            local ci=${#child_lines[@]}
+            while [[ $ci -gt 0 ]]; do
+                ci=$((ci - 1))
+                local child="${child_lines[$ci]}"
+                local cid
+                cid=$(echo "$child" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+                if [[ -z "$cid" ]]; then continue; fi
+                if echo "$seen_child_ids" | grep -q "|$cid|"; then continue; fi
+                seen_child_ids="${seen_child_ids}|$cid|"
+                unique_children=("$child" "${unique_children[@]}")
+            done
+            for child in "${unique_children[@]}"; do
+                local cid cstatus ctitle
+                cid=$(echo "$child" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+                cstatus=$(echo "$child" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+                ctitle=$(echo "$child" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+                local icon="[ ]"
+                [[ "$cstatus" == "closed" ]] && icon="[x]"
+                [[ "$cstatus" == "in_progress" ]] && icon="[>]"
+                echo "  $icon $cid: $ctitle ($cstatus)"
+            done
+        fi
+    fi
+}
+
+cmd_update() {
+    local id="$1"; shift
+    local issue
+    issue=$(_find_issue "$id")
+    if [[ -z "$issue" ]]; then
+        echo "Issue $id not found" >&2
+        exit 1
+    fi
+
+    local now
+    now=$(_timestamp)
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status)
+                local new_status="$2"
+                issue=$(echo "$issue" | sed "s/\"status\":\"[^\"]*\"/\"status\":\"$new_status\"/")
+                shift 2
+                ;;
+            --title)
+                local new_title
+                new_title=$(_json_escape "$2")
+                issue=$(echo "$issue" | sed "s/\"title\":\"[^\"]*\"/\"title\":\"$new_title\"/")
+                shift 2
+                ;;
+            --description)
+                local new_desc
+                new_desc=$(_json_escape "$2")
+                issue=$(echo "$issue" | sed "s/\"description\":\"[^\"]*\"/\"description\":\"$new_desc\"/")
+                shift 2
+                ;;
+            --design)
+                local new_design
+                new_design=$(_json_escape "$2")
+                issue=$(echo "$issue" | sed "s/\"design\":\"[^\"]*\"/\"design\":\"$new_design\"/")
+                shift 2
+                ;;
+            --acceptance)
+                local new_accept
+                new_accept=$(_json_escape "$2")
+                issue=$(echo "$issue" | sed "s/\"acceptance\":\"[^\"]*\"/\"acceptance\":\"$new_accept\"/")
+                shift 2
+                ;;
+            --notes)
+                # Append to description
+                shift 2
+                ;;
+            --claim)
+                issue=$(echo "$issue" | sed 's/"status":"[^"]*"/"status":"in_progress"/')
+                shift
+                ;;
+            --json)
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    issue=$(echo "$issue" | sed "s/\"updated\":\"[^\"]*\"/\"updated\":\"$now\"/")
+    echo "$issue" >> "$DB_FILE"
+    echo "Updated $id"
+}
+
+cmd_close() {
+    local json_output=false
+    local reason=""
+    local ids=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --reason) reason="$2"; shift 2 ;;
+            --json) json_output=true; shift ;;
+            *) ids+=("$1"); shift ;;
+        esac
+    done
+
+    for id in "${ids[@]}"; do
+        local issue
+        issue=$(_find_issue "$id")
+        if [[ -z "$issue" ]]; then
+            echo "Issue $id not found" >&2
+            continue
+        fi
+        local now
+        now=$(_timestamp)
+        issue=$(echo "$issue" | sed 's/"status":"[^"]*"/"status":"closed"/')
+        issue=$(echo "$issue" | sed "s/\"updated\":\"[^\"]*\"/\"updated\":\"$now\"/")
+        echo "$issue" >> "$DB_FILE"
+        echo "Closed $id"
+    done
+}
+
+cmd_ready() {
+    if [[ ! -f "$DB_FILE" ]] || [[ ! -s "$DB_FILE" ]]; then
+        echo "No issues."
+        return
+    fi
+
+    # Show open tasks (not epics) that have no open blockers
+    # Simple version: show all open non-epic tasks
+    local seen_ids=""
+    local lines=()
+    while IFS= read -r line; do
+        lines+=("$line")
+    done < "$DB_FILE"
+
+    printf "%-12s %-6s %s\n" "ID" "PRI" "TITLE"
+    printf "%-12s %-6s %s\n" "---" "---" "---"
+
+    local i=${#lines[@]}
+    local output_ids=""
+    while [[ $i -gt 0 ]]; do
+        i=$((i - 1))
+        local line="${lines[$i]}"
+        local id status type
+        id=$(echo "$line" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [[ -z "$id" ]]; then continue; fi
+        if echo "$seen_ids" | grep -q "|$id|"; then continue; fi
+        seen_ids="${seen_ids}|$id|"
+
+        status=$(echo "$line" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+        type=$(echo "$line" | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+        if [[ "$status" == "open" ]] && [[ "$type" != "epic" ]]; then
+            local pri title
+            pri=$(echo "$line" | grep -o '"priority":[0-9]*' | head -1 | cut -d: -f2)
+            title=$(echo "$line" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+            output_ids="$output_ids$id|P$pri|$title\n"
+        fi
+    done
+
+    if [[ -n "$output_ids" ]]; then
+        echo -e "$output_ids" | while IFS='|' read -r id pri title; do
+            [[ -z "$id" ]] && continue
+            printf "%-12s %-6s %s\n" "$id" "$pri" "$title"
+        done
+    else
+        echo "No ready tasks."
+    fi
+}
+
+cmd_epic_status() {
+    local id="$1"
+    local issue
+    issue=$(_find_issue "$id")
+    if [[ -z "$issue" ]]; then
+        echo "Epic $id not found" >&2
+        exit 1
+    fi
+
+    local title
+    title=$(echo "$issue" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    echo "=== Epic: $title ($id) ==="
+
+    if [[ ! -f "$DB_FILE" ]]; then
+        echo "No children."
+        return
+    fi
+
+    local total=0 closed=0 in_progress=0 open=0
+
+    # Read all children, deduplicate keeping last (latest) version per ID
+    local child_lines=()
+    while IFS= read -r child; do
+        [[ -z "$child" ]] && continue
+        child_lines+=("$child")
+    done < <(grep "\"parent\":\"$id\"" "$DB_FILE" 2>/dev/null || true)
+
+    local seen_child_ids=""
+    local unique_children=()
+    local ci=${#child_lines[@]}
+    while [[ $ci -gt 0 ]]; do
+        ci=$((ci - 1))
+        local child="${child_lines[$ci]}"
+        local cid
+        cid=$(echo "$child" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        if [[ -z "$cid" ]]; then continue; fi
+        if echo "$seen_child_ids" | grep -q "|$cid|"; then continue; fi
+        seen_child_ids="${seen_child_ids}|$cid|"
+        unique_children=("$child" "${unique_children[@]}")
+    done
+
+    for child in "${unique_children[@]}"; do
+        local cid cstatus ctitle
+        cid=$(echo "$child" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        cstatus=$(echo "$child" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+        ctitle=$(echo "$child" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+        total=$((total + 1))
+        case "$cstatus" in
+            closed) closed=$((closed + 1)); echo "  [x] $cid: $ctitle" ;;
+            in_progress) in_progress=$((in_progress + 1)); echo "  [>] $cid: $ctitle" ;;
+            *) open=$((open + 1)); echo "  [ ] $cid: $ctitle" ;;
+        esac
+    done
+
+    local pct=0
+    if [[ $total -gt 0 ]]; then
+        pct=$((closed * 100 / total))
+    fi
+
+    echo ""
+    echo "Progress: $closed/$total ($pct%)"
+    echo "  Open: $open | In Progress: $in_progress | Closed: $closed"
+}
+
+cmd_comment() {
+    local id="$1"; shift
+    local msg="$*"
+    local now
+    now=$(_timestamp)
+    local esc_msg
+    esc_msg=$(_json_escape "$msg")
+
+    # Append comment as a separate record type
+    echo "{\"type\":\"comment\",\"issue_id\":\"$id\",\"message\":\"$esc_msg\",\"timestamp\":\"$now\"}" >> "$DB_FILE"
+    echo "Comment added to $id"
+}
+
+cmd_sync() {
+    echo "State is in $DB_FILE (git-tracked)."
+    if command -v git > /dev/null 2>&1; then
+        if git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+            git add "$BEADS_DIR/" 2>/dev/null || true
+            echo "Staged $BEADS_DIR/ for commit."
+        fi
+    fi
+}
+
+# Main dispatch
+case "${1:-help}" in
+    init)
+        cmd_init
+        ;;
+    create)
+        shift
+        cmd_create "$@"
+        ;;
+    list)
+        shift
+        cmd_list "$@"
+        ;;
+    show)
+        shift
+        cmd_show "$@"
+        ;;
+    update)
+        shift
+        cmd_update "$@"
+        ;;
+    close)
+        shift
+        cmd_close "$@"
+        ;;
+    ready)
+        shift
+        cmd_ready "$@"
+        ;;
+    comment)
+        shift
+        cmd_comment "$@"
+        ;;
+    epic)
+        shift
+        case "${1:-}" in
+            status)
+                shift
+                cmd_epic_status "$@"
+                ;;
+            *)
+                echo "Usage: bd epic status <id>"
+                ;;
+        esac
+        ;;
+    sync)
+        cmd_sync
+        ;;
+    help | --help | -h)
+        echo "bd - Beads-compatible task tracker for Mole"
+        echo ""
+        echo "Commands:"
+        echo "  init              Initialize .beads/ in project"
+        echo "  create \"title\"    Create a task (-t type, -p priority, --parent id)"
+        echo "  list              List issues (--status open/closed/in_progress)"
+        echo "  show <id>         Show task details"
+        echo "  update <id>       Update fields (--status, --title, --description, --claim)"
+        echo "  close <id>        Close a task (--reason \"text\")"
+        echo "  ready             Show actionable tasks"
+        echo "  epic status <id>  Show epic progress"
+        echo "  comment <id> msg  Add comment"
+        echo "  sync              Stage .beads/ for git"
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        echo "Run 'bd help' for usage." >&2
+        exit 1
+        ;;
+esac

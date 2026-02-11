@@ -1,0 +1,48 @@
+#!/bin/bash
+# commit-msg hook for Mole.
+# Validates commit message format: type(scope): description
+# Install: ./scripts/install-hooks.sh
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(head -1 "$COMMIT_MSG_FILE")
+
+# Allow merge commits
+if echo "$COMMIT_MSG" | grep -qE '^Merge '; then
+    exit 0
+fi
+
+# Allow revert commits
+if echo "$COMMIT_MSG" | grep -qE '^Revert '; then
+    exit 0
+fi
+
+# Allow fixup/squash commits
+if echo "$COMMIT_MSG" | grep -qE '^(fixup|squash)! '; then
+    exit 0
+fi
+
+# Validate format: type(scope): description
+VALID_TYPES="feat|fix|refactor|test|docs|chore|security"
+VALID_SCOPES="core|clean|optimize|analyze|status|uninstall|ci|purge|beads"
+
+if ! echo "$COMMIT_MSG" | grep -qE "^($VALID_TYPES)\(($VALID_SCOPES)\): .+"; then
+    echo ""
+    echo "ERROR: Commit message does not match convention."
+    echo ""
+    echo "Expected format: type(scope): description"
+    echo ""
+    echo "  Types:  feat, fix, refactor, test, docs, chore, security"
+    echo "  Scopes: core, clean, optimize, analyze, status, uninstall, ci, purge, beads"
+    echo ""
+    echo "Examples:"
+    echo "  feat(clean): add Docker cache cleanup module"
+    echo "  fix(core): handle empty path in safe_remove"
+    echo "  test(uninstall): add batch removal edge cases"
+    echo "  docs(ci): update release workflow documentation"
+    echo ""
+    echo "Your message: $COMMIT_MSG"
+    echo ""
+    exit 1
+fi
